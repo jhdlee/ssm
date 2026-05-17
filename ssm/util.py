@@ -12,6 +12,7 @@ from scipy.special import gammaln, digamma, polygamma
 SEED = hash("ssm") % (2**32)
 LOG_EPS = 1e-16
 DIV_EPS = 1e-16
+TRIAL_TAG_KEY = "trial_lengths"
 
 def compute_state_overlap(z1, z2, K1=None, K2=None):
     assert z1.dtype == int and z2.dtype == int
@@ -84,6 +85,51 @@ def random_rotation(n, theta=None):
     out[:2, :2] = rot
     q = np.linalg.qr(np.random.randn(n, n))[0]
     return q.dot(out).dot(q.T)
+
+
+def trial_lengths_from_tag(tag, T, require=False):
+    """
+    Return a validated vector of trial lengths for a concatenated sequence.
+
+    If `require` is False and no trial lengths are provided, the whole sequence
+    is treated as one trial. This keeps the helper harmless for single-sequence
+    use while allowing trial-aware models to request strict validation.
+    """
+    if tag is None or TRIAL_TAG_KEY not in tag:
+        if require:
+            raise ValueError("tag must contain '{}' for trial-aware models.".format(TRIAL_TAG_KEY))
+        return np.array([T], dtype=int)
+
+    trial_lengths = np.asarray(tag[TRIAL_TAG_KEY], dtype=int)
+    if trial_lengths.ndim != 1:
+        raise ValueError("'{}' must be a one-dimensional array.".format(TRIAL_TAG_KEY))
+    if len(trial_lengths) == 0:
+        raise ValueError("'{}' must contain at least one trial.".format(TRIAL_TAG_KEY))
+    if np.any(trial_lengths <= 0):
+        raise ValueError("'{}' entries must be positive.".format(TRIAL_TAG_KEY))
+    if int(np.sum(trial_lengths)) != int(T):
+        raise ValueError(
+            "'{}' must sum to sequence length {}; got {}.".format(
+                TRIAL_TAG_KEY, T, int(np.sum(trial_lengths))))
+    return trial_lengths
+
+
+def trial_start_indices_from_lengths(trial_lengths):
+    return np.concatenate(([0], np.cumsum(trial_lengths)[:-1])).astype(int)
+
+
+def trial_start_mask_from_tag(tag, T, require=False):
+    trial_lengths = trial_lengths_from_tag(tag, T, require=require)
+    starts = trial_start_indices_from_lengths(trial_lengths)
+    start_mask = np.zeros(T, dtype=bool)
+    start_mask[starts] = True
+    return start_mask
+
+
+def trial_boundary_transition_indices_from_tag(tag, T, require=False):
+    trial_lengths = trial_lengths_from_tag(tag, T, require=require)
+    starts = trial_start_indices_from_lengths(trial_lengths)
+    return (starts[1:] - 1).astype(int)
 
 
 def ensure_args_are_lists(f):

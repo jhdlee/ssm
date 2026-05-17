@@ -7,7 +7,8 @@ from autograd.scipy.special import logsumexp
 from autograd.scipy.stats import dirichlet
 from autograd import hessian
 
-from ssm.util import one_hot, logistic, relu, rle, ensure_args_are_lists, LOG_EPS, DIV_EPS
+from ssm.util import one_hot, logistic, relu, rle, ensure_args_are_lists, LOG_EPS, DIV_EPS, \
+    trial_lengths_from_tag, trial_boundary_transition_indices_from_tag
 from ssm.regression import fit_multiclass_logistic_regression, fit_negative_binomial_integer_r
 from ssm.stats import multivariate_normal_logpdf
 from ssm.optimizers import adam, bfgs, lbfgs, rmsprop, sgd
@@ -126,6 +127,51 @@ class StationaryTransitions(Transitions):
         # Return (T-1, D, D) array of blocks for the diagonal of the Hessian
         T, D = data.shape
         return np.zeros((T-1, D, D))
+
+
+class TrialLockedTransitions(StationaryTransitions):
+    """
+    Trial-level Markov transitions represented in a time-bin HMM.
+
+    The discrete state is forced to remain fixed inside each trial. At trial
+    boundaries, the state transitions according to a learned stationary matrix.
+    Trial boundaries are supplied with tag={"trial_lengths": ...}.
+    """
+    _LOG_IMPOSSIBLE = -1e16
+
+    def log_transition_matrices(self, data, input, mask, tag):
+        T = data.shape[0]
+        K = self.K
+        trial_lengths_from_tag(tag, T, require=True)
+
+        learned_log_Ps = self.log_Ps - logsumexp(self.log_Ps, axis=1, keepdims=True)
+        log_identity = self._LOG_IMPOSSIBLE * np.ones((K, K))
+        log_identity[np.arange(K), np.arange(K)] = 0.0
+
+        log_Ps = np.tile(log_identity[None, :, :], (max(T - 1, 0), 1, 1))
+        boundary_idxs = trial_boundary_transition_indices_from_tag(tag, T, require=True)
+        if len(boundary_idxs) > 0:
+            log_Ps[boundary_idxs] = learned_log_Ps
+        return log_Ps
+
+    def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
+        K = self.K
+        counts = np.zeros((K, K))
+        for data, tag, (_, Ezzp1, _) in zip(datas, tags, expectations):
+            T = data.shape[0]
+            boundary_idxs = trial_boundary_transition_indices_from_tag(tag, T, require=True)
+            if len(boundary_idxs) > 0:
+                counts += np.sum(Ezzp1[boundary_idxs], axis=0)
+
+        P = counts + 1e-32
+        P = np.nan_to_num(P / P.sum(axis=-1, keepdims=True))
+        P = np.where(P.sum(axis=-1, keepdims=True) == 0, 1.0 / K, P)
+        log_P = np.log(P)
+        self.log_Ps = log_P - logsumexp(log_P, axis=-1, keepdims=True)
+
+    def neg_hessian_expected_log_trans_prob(self, data, input, mask, tag, expected_joints):
+        T, D = data.shape
+        return np.zeros((T - 1, D, D))
 
 
 class ConstrainedStationaryTransitions(StationaryTransitions):

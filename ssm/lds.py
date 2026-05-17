@@ -11,7 +11,8 @@ from ssm.optimizers import adam_step, rmsprop_step, sgd_step, lbfgs, \
 from ssm.primitives import hmm_normalizer
 from ssm.messages import hmm_expected_states, viterbi
 from ssm.util import ensure_args_are_lists, \
-    ensure_slds_args_not_none, ensure_variational_args_are_lists, ssm_pbar
+    ensure_slds_args_not_none, ensure_variational_args_are_lists, ssm_pbar, \
+    trial_lengths_from_tag
 
 import ssm.observations as obs
 import ssm.transitions as trans
@@ -50,6 +51,7 @@ class SLDS(object):
             standard=trans.StationaryTransitions,
             stationary=trans.StationaryTransitions,
             sticky=trans.StickyTransitions,
+            trial_locked=trans.TrialLockedTransitions,
             inputdriven=trans.InputDrivenTransitions,
             recurrent=trans.RecurrentTransitions,
             recurrent_only=trans.RecurrentOnlyTransitions,
@@ -73,6 +75,7 @@ class SLDS(object):
         dynamics_classes = dict(
             none=obs.GaussianObservations,
             gaussian=obs.AutoRegressiveObservations,
+            trial_gaussian=obs.TrialResetAutoRegressiveObservations,
             diagonal_gaussian=obs.AutoRegressiveDiagonalNoiseObservations,
             t=obs.RobustAutoRegressiveObservations,
             studentst=obs.RobustAutoRegressiveObservations,
@@ -284,6 +287,50 @@ class SLDS(object):
         log_likes = self.dynamics.log_likelihoods(variational_mean, input, np.ones_like(variational_mean, dtype=bool), tag)
         log_likes += self.emissions.log_likelihoods(data, input, mask, tag, variational_mean)
         return viterbi(pi0, Ps, log_likes)
+
+    @ensure_slds_args_not_none
+    def most_likely_trial_states(self, variational_mean, data, input=None, mask=None,
+                                 tag=None, expand=True):
+        """
+        Decode one discrete state per trial and optionally expand to time bins.
+        This is the strict decoder for trial-locked SLDS models.
+        """
+        T = data.shape[0]
+        trial_lengths = trial_lengths_from_tag(tag, T, require=True)
+        pi0 = self.init_state_distn.initial_state_distn
+        P = self.transitions.transition_matrix
+
+        log_likes = self.dynamics.log_likelihoods(
+            variational_mean, input, np.ones_like(variational_mean, dtype=bool), tag)
+        log_likes += self.emissions.log_likelihoods(data, input, mask, tag, variational_mean)
+
+        trial_log_likes = []
+        start = 0
+        for length in trial_lengths:
+            stop = start + int(length)
+            trial_log_likes.append(np.sum(log_likes[start:stop], axis=0))
+            start = stop
+        trial_log_likes = np.asarray(trial_log_likes)
+
+        trial_z = viterbi(pi0, P[None, :, :], trial_log_likes)
+        if expand:
+            return np.repeat(trial_z, trial_lengths)
+        return trial_z
+
+    @ensure_slds_args_not_none
+    def trial_state_expectations(self, variational_mean, data, input=None, mask=None, tag=None):
+        """
+        Aggregate per-time posterior state expectations into per-trial summaries.
+        """
+        trial_lengths = trial_lengths_from_tag(tag, data.shape[0], require=True)
+        Ez, _, normalizer = self.expected_states(variational_mean, data, input, mask, tag)
+        trial_Ez = []
+        start = 0
+        for length in trial_lengths:
+            stop = start + int(length)
+            trial_Ez.append(np.mean(Ez[start:stop], axis=0))
+            start = stop
+        return np.asarray(trial_Ez), normalizer
 
     @ensure_slds_args_not_none
     def smooth(self, variational_mean, data, input=None, mask=None, tag=None):

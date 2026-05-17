@@ -8,7 +8,8 @@ from autograd.scipy.special import gammaln, digamma, logsumexp
 from autograd.scipy.special import logsumexp
 
 from ssm.util import random_rotation, ensure_args_are_lists, \
-    logistic, logit, one_hot
+    logistic, logit, one_hot, trial_lengths_from_tag, \
+    trial_start_mask_from_tag
 from ssm.regression import fit_linear_regression, generalized_newton_studentst_dof
 from ssm.preprocessing import interpolate_data
 from ssm.cstats import robust_ar_statistics
@@ -1206,6 +1207,243 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
         # E_q(z) x_{t+1} Sigma_{z_t+1}^{-1} A_{z_t+1} x_t
         off_diag_terms = np.array([inv_Sigma@A for A, inv_Sigma in zip(self.As, inv_Sigmas)])
         J_dyn_21 = -1 * np.sum(Ez[1:,:,None,None] * off_diag_terms[None,:], axis=1)
+
+        return J_ini, J_dyn_11, J_dyn_21, J_dyn_22
+
+
+class TrialResetAutoRegressiveObservations(AutoRegressiveObservations):
+    """
+    Auto-regressive dynamics that reset at known trial boundaries.
+
+    For every trial start, x_t is scored under the state-specific initial
+    distribution. For all other time bins, x_t is scored under the usual
+    state-specific AR dynamics from x_{t-1}. Trial boundaries are supplied with
+    tag={"trial_lengths": ...}.
+    """
+    def __init__(self, K, D, M=0, lags=1, **kwargs):
+        if lags != 1:
+            raise ValueError("TrialResetAutoRegressiveObservations only supports lags=1.")
+        super(TrialResetAutoRegressiveObservations, self).__init__(
+            K, D, M=M, lags=lags, **kwargs)
+
+    def _trial_start_mask(self, data, tag):
+        return trial_start_mask_from_tag(tag, data.shape[0], require=True)
+
+    def log_likelihoods(self, data, input, mask, tag=None):
+        assert np.all(mask), "Cannot compute likelihood of autoregressive obsevations with missing data."
+        start_mask = self._trial_start_mask(data, tag)
+        T = data.shape[0]
+        K, M = self.K, self.M
+        lls = np.zeros((T, K))
+
+        starts = np.where(start_mask)[0]
+        targets = np.where(~start_mask)[0]
+        for k in range(K):
+            if len(starts) > 0:
+                lls[starts, k] = stats.multivariate_normal_logpdf(
+                    data[starts], self.mu_init[k], self.Sigmas_init[k])
+
+            if len(targets) > 0:
+                mus = data[targets - 1].dot(self.As[k].T)
+                if M > 0:
+                    mus += input[targets, :M].dot(self.Vs[k].T)
+                mus += self.bs[k]
+                lls[targets, k] = stats.multivariate_normal_logpdf(
+                    data[targets], mus, self.Sigmas[k])
+
+        return lls
+
+    def _get_sufficient_statistics(self, expectations, datas, inputs, tags=None):
+        K, D, M = self.K, self.D, self.M
+        D_in = D + M + 1
+        tags = [None] * len(datas) if tags is None else tags
+
+        ExuxuTs = np.zeros((K, D_in, D_in))
+        ExuyTs = np.zeros((K, D_in, D))
+        EyyTs = np.zeros((K, D, D))
+        Ens = np.zeros(K)
+
+        init_Exs = np.zeros((K, D))
+        init_ExxTs = np.zeros((K, D, D))
+        init_Ens = np.zeros(K)
+
+        for (Ez, _, _), data, input, tag in zip(expectations, datas, inputs, tags):
+            start_mask = self._trial_start_mask(data, tag)
+            starts = np.where(start_mask)[0]
+            targets = np.where(~start_mask)[0]
+            ExxT = np.einsum('ti,tj->tij', data, data)
+
+            for k in range(K):
+                w0 = Ez[starts, k]
+                init_Exs[k] += np.einsum('t,ti->i', w0, data[starts])
+                init_ExxTs[k] += np.einsum('t,tij->ij', w0, ExxT[starts])
+                init_Ens[k] += np.sum(w0)
+
+                w = Ez[targets, k]
+                prev = data[targets - 1]
+                y = data[targets]
+                u = input[targets, :M]
+
+                ExuxuTs[k, :D, :D] += np.einsum('t,ti,tj->ij', w, prev, prev)
+                if M > 0:
+                    ExuxuTs[k, :D, D:D + M] += np.einsum('t,ti,tj->ij', w, prev, u)
+                    ExuxuTs[k, D:D + M, D:D + M] += np.einsum('t,ti,tj->ij', w, u, u)
+                    ExuxuTs[k, D:D + M, -1] += np.einsum('t,ti->i', w, u)
+                    ExuyTs[k, D:D + M, :] += np.einsum('t,ti,tj->ij', w, u, y)
+                ExuxuTs[k, :D, -1] += np.einsum('t,ti->i', w, prev)
+                ExuxuTs[k, -1, -1] += np.sum(w)
+
+                ExuyTs[k, :D, :] += np.einsum('t,ti,tj->ij', w, prev, y)
+                ExuyTs[k, -1, :] += np.einsum('t,ti->i', w, y)
+
+                EyyTs[k] += np.einsum('t,ti,tj->ij', w, y, y)
+                Ens[k] += np.sum(w)
+
+        for k in range(K):
+            ExuxuTs[k, D:D + M, :D] = ExuxuTs[k, :D, D:D + M].T
+            ExuxuTs[k, -1, :D] = ExuxuTs[k, :D, -1].T
+            ExuxuTs[k, -1, D:D + M] = ExuxuTs[k, D:D + M, -1].T
+
+        return ExuxuTs, ExuyTs, EyyTs, Ens, init_Exs, init_ExxTs, init_Ens
+
+    def _extend_given_sufficient_statistics(self, expectations, continuous_expectations, inputs, tags=None):
+        K, D, M = self.K, self.D, self.M
+        D_in = D + M + 1
+        tags = [None] * len(inputs) if tags is None else tags
+
+        ExuxuTs = np.zeros((K, D_in, D_in))
+        ExuyTs = np.zeros((K, D_in, D))
+        EyyTs = np.zeros((K, D, D))
+        Ens = np.zeros(K)
+
+        init_Exs = np.zeros((K, D))
+        init_ExxTs = np.zeros((K, D, D))
+        init_Ens = np.zeros(K)
+
+        for (Ez, _, _), (_, Ex, smoothed_sigmas, Exxn), u, tag in \
+                zip(expectations, continuous_expectations, inputs, tags):
+            start_mask = trial_start_mask_from_tag(tag, Ex.shape[0], require=True)
+            starts = np.where(start_mask)[0]
+            targets = np.where(~start_mask)[0]
+            ExxT = smoothed_sigmas + np.einsum('ti,tj->tij', Ex, Ex)
+
+            for k in range(K):
+                w0 = Ez[starts, k]
+                init_Exs[k] += np.einsum('t,ti->i', w0, Ex[starts])
+                init_ExxTs[k] += np.einsum('t,tij->ij', w0, ExxT[starts])
+                init_Ens[k] += np.sum(w0)
+
+                w = Ez[targets, k]
+                prev = targets - 1
+                ExuxuTs[k, :D, :D] += np.einsum('t,tij->ij', w, ExxT[prev])
+                if M > 0:
+                    ExuxuTs[k, :D, D:D + M] += np.einsum('t,ti,tj->ij', w, Ex[prev], u[targets, :M])
+                    ExuxuTs[k, D:D + M, D:D + M] += np.einsum('t,ti,tj->ij', w, u[targets, :M], u[targets, :M])
+                    ExuxuTs[k, D:D + M, -1] += np.einsum('t,ti->i', w, u[targets, :M])
+                    ExuyTs[k, D:D + M, :] += np.einsum('t,ti,tj->ij', w, u[targets, :M], Ex[targets])
+                ExuxuTs[k, :D, -1] += np.einsum('t,ti->i', w, Ex[prev])
+                ExuxuTs[k, -1, -1] += np.sum(w)
+
+                ExuyTs[k, :D, :] += np.einsum('t,tij->ij', w, Exxn[prev])
+                ExuyTs[k, -1, :] += np.einsum('t,ti->i', w, Ex[targets])
+
+                EyyTs[k] += np.einsum('t,tij->ij', w, ExxT[targets])
+                Ens[k] += np.sum(w)
+
+        for k in range(K):
+            ExuxuTs[k, D:D + M, :D] = ExuxuTs[k, :D, D:D + M].T
+            ExuxuTs[k, -1, :D] = ExuxuTs[k, :D, -1].T
+            ExuxuTs[k, -1, D:D + M] = ExuxuTs[k, D:D + M, -1].T
+
+        return ExuxuTs, ExuyTs, EyyTs, Ens, init_Exs, init_ExxTs, init_Ens
+
+    def m_step(self, expectations, datas, inputs, masks, tags,
+               continuous_expectations=None, **kwargs):
+        K, D, M = self.K, self.D, self.M
+        if continuous_expectations is None:
+            stats_tuple = self._get_sufficient_statistics(expectations, datas, inputs, tags)
+        else:
+            stats_tuple = self._extend_given_sufficient_statistics(
+                expectations, continuous_expectations, inputs, tags)
+
+        ExuxuTs, ExuyTs, EyyTs, Ens, init_Exs, init_ExxTs, init_Ens = stats_tuple
+
+        As = np.zeros((K, D, D))
+        Vs = np.zeros((K, D, M))
+        bs = np.zeros((K, D))
+        Sigmas = np.zeros((K, D, D))
+        mu_init = np.array(self.mu_init)
+        Sigmas_init = np.array(self.Sigmas_init)
+
+        for k in range(K):
+            Wk = np.linalg.solve(ExuxuTs[k] + self.J0[k], ExuyTs[k] + self.h0[k]).T
+            As[k] = Wk[:, :D]
+            Vs[k] = Wk[:, D:D + M]
+            bs[k] = Wk[:, -1]
+
+            EWxyT = Wk @ ExuyTs[k]
+            sqerr = EyyTs[k] - EWxyT.T - EWxyT + Wk @ ExuxuTs[k] @ Wk.T
+            nu = self.nu0 + Ens[k]
+            Sigmas[k] = (sqerr + self.Psi0) / (nu + D + 1)
+
+            if init_Ens[k] > 1e-8:
+                mu_init[k] = init_Exs[k] / init_Ens[k]
+                init_sqerr = init_ExxTs[k] - init_Ens[k] * np.outer(mu_init[k], mu_init[k])
+                init_nu = self.nu0 + init_Ens[k]
+                Sigmas_init[k] = (init_sqerr + self.Psi0) / (init_nu + D + 1)
+
+        unused = np.where(Ens < 1)[0]
+        used = np.where(Ens > 1)[0]
+        if len(unused) > 0 and len(used) > 0:
+            for k in unused:
+                i = npr.choice(used)
+                As[k] = As[i] + 0.01 * npr.randn(*As[i].shape)
+                Vs[k] = Vs[i] + 0.01 * npr.randn(*Vs[i].shape)
+                bs[k] = bs[i] + 0.01 * npr.randn(*bs[i].shape)
+                Sigmas[k] = Sigmas[i]
+                mu_init[k] = mu_init[i] + 0.01 * npr.randn(*mu_init[i].shape)
+                Sigmas_init[k] = Sigmas_init[i]
+
+        self.As = As
+        self.Vs = Vs
+        self.bs = bs
+        self.Sigmas = Sigmas
+        self.mu_init = mu_init
+        self.Sigmas_init = Sigmas_init
+
+    def sample_x(self, z, xhist, input=None, tag=None, with_noise=True):
+        if tag is not None and "trial_lengths" in tag:
+            current_t = xhist.shape[0]
+            trial_lengths = trial_lengths_from_tag(tag, np.sum(tag["trial_lengths"]), require=True)
+            starts = np.concatenate(([0], np.cumsum(trial_lengths)[:-1])).astype(int)
+            if current_t in set(starts):
+                S = np.linalg.cholesky(self.Sigmas_init[z]) if with_noise else 0
+                return self.mu_init[z] + np.dot(S, npr.randn(self.D))
+        return super(TrialResetAutoRegressiveObservations, self).sample_x(
+            z, xhist, input=input, tag=tag, with_noise=with_noise)
+
+    def neg_hessian_expected_log_dynamics_prob(self, Ez, data, input, mask, tag=None):
+        assert np.all(mask), "Cannot compute negative Hessian of autoregressive obsevations with missing data."
+        start_mask = self._trial_start_mask(data, tag)
+        T, D = data.shape
+
+        inv_Sigmas_init = np.linalg.inv(self.Sigmas_init)
+        inv_Sigmas = np.linalg.inv(self.Sigmas)
+        dynamics_terms = np.array([A.T @ inv_Sigma @ A for A, inv_Sigma in zip(self.As, inv_Sigmas)])
+        off_diag_terms = np.array([inv_Sigma @ A for A, inv_Sigma in zip(self.As, inv_Sigmas)])
+
+        J_ini = np.sum(Ez[0, :, None, None] * inv_Sigmas_init, axis=0)
+        J_dyn_11 = np.zeros((T - 1, D, D))
+        J_dyn_21 = np.zeros((T - 1, D, D))
+        J_dyn_22 = np.zeros((T - 1, D, D))
+
+        for t in range(1, T):
+            if start_mask[t]:
+                J_dyn_22[t - 1] = np.sum(Ez[t, :, None, None] * inv_Sigmas_init, axis=0)
+            else:
+                J_dyn_11[t - 1] = np.sum(Ez[t, :, None, None] * dynamics_terms, axis=0)
+                J_dyn_22[t - 1] = np.sum(Ez[t, :, None, None] * inv_Sigmas, axis=0)
+                J_dyn_21[t - 1] = -1 * np.sum(Ez[t, :, None, None] * off_diag_terms, axis=0)
 
         return J_ini, J_dyn_11, J_dyn_21, J_dyn_22
 
