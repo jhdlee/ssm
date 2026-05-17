@@ -1232,26 +1232,22 @@ class TrialResetAutoRegressiveObservations(AutoRegressiveObservations):
     def log_likelihoods(self, data, input, mask, tag=None):
         assert np.all(mask), "Cannot compute likelihood of autoregressive obsevations with missing data."
         start_mask = self._trial_start_mask(data, tag)
-        T = data.shape[0]
         K, M = self.K, self.M
-        lls = np.zeros((T, K))
+        prev_data = np.concatenate((data[:1], data[:-1]), axis=0)
 
-        starts = np.where(start_mask)[0]
-        targets = np.where(~start_mask)[0]
+        lls = []
         for k in range(K):
-            if len(starts) > 0:
-                lls[starts, k] = stats.multivariate_normal_logpdf(
-                    data[starts], self.mu_init[k], self.Sigmas_init[k])
+            init_ll = stats.multivariate_normal_logpdf(
+                data, self.mu_init[k], self.Sigmas_init[k])
 
-            if len(targets) > 0:
-                mus = data[targets - 1].dot(self.As[k].T)
-                if M > 0:
-                    mus += input[targets, :M].dot(self.Vs[k].T)
-                mus += self.bs[k]
-                lls[targets, k] = stats.multivariate_normal_logpdf(
-                    data[targets], mus, self.Sigmas[k])
+            mus = prev_data.dot(self.As[k].T) + self.bs[k]
+            if M > 0:
+                mus = mus + input[:, :M].dot(self.Vs[k].T)
+            ar_ll = stats.multivariate_normal_logpdf(data, mus, self.Sigmas[k])
 
-        return lls
+            lls.append(np.where(start_mask, init_ll, ar_ll))
+
+        return np.column_stack(lls)
 
     def _get_sufficient_statistics(self, expectations, datas, inputs, tags=None):
         K, D, M = self.K, self.D, self.M
