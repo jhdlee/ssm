@@ -221,3 +221,28 @@ def test_trial_locked_slds_laplace_em_smoke():
     for n in range(num_trials):
         z_trial = zhat[n * trial_len:(n + 1) * trial_len]
         assert np.all(z_trial == z_trial[0])
+
+
+def test_trial_locked_slds_initialize_preserves_tags():
+    N, K, D = 5, 2, 2
+    num_trials, trial_len = 2, 3
+    T = num_trials * trial_len
+    tag = {"trial_lengths": np.full(num_trials, trial_len)}
+    data = 0.1 * npr.randn(T, N)
+
+    model = ssm.SLDS(
+        N,
+        K,
+        D,
+        transitions="trial_locked",
+        dynamics="trial_gaussian",
+        emissions="gaussian",
+        single_subspace=False,
+    )
+    model.initialize(
+        [data],
+        tags=[tag],
+        num_init_iters=1,
+        num_init_restarts=1,
+        verbose=0,
+    )

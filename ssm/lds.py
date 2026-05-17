@@ -198,7 +198,7 @@ class SLDS(object):
                       init_method=discrete_state_init_method)
 
             #Keep track of the arhmm that led to the highest log probability
-            current_lp = arhmm.log_probability(xs)
+            current_lp = arhmm.log_probability(xs, inputs=inputs, masks=xmasks, tags=tags)
             if current_lp > best_lp:
                 best_lp =  copy.deepcopy(current_lp)
                 best_arhmm = copy.deepcopy(arhmm)
