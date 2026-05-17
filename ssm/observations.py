@@ -1240,9 +1240,9 @@ class TrialResetAutoRegressiveObservations(AutoRegressiveObservations):
             init_ll = stats.multivariate_normal_logpdf(
                 data, self.mu_init[k], self.Sigmas_init[k])
 
-            mus = prev_data.dot(self.As[k].T) + self.bs[k]
+            mus = np.dot(prev_data, self.As[k].T) + self.bs[k]
             if M > 0:
-                mus = mus + input[:, :M].dot(self.Vs[k].T)
+                mus = mus + np.dot(input[:, :M], self.Vs[k].T)
             ar_ll = stats.multivariate_normal_logpdf(data, mus, self.Sigmas[k])
 
             lls.append(np.where(start_mask, init_ll, ar_ll))
