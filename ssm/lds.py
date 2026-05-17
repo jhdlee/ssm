@@ -5,6 +5,7 @@ from tqdm.auto import trange
 import autograd.numpy as np
 import autograd.numpy.random as npr
 from autograd import value_and_grad, grad
+from autograd.scipy.special import logsumexp
 
 from ssm.optimizers import adam_step, rmsprop_step, sgd_step, lbfgs, \
     convex_combination, newtons_method_block_tridiag_hessian
@@ -467,12 +468,60 @@ class SLDS(object):
                     [self.emissions.log_likelihoods(data, input, mask, tag, x)
                      for x in x_samples], axis=0)
 
-            discrete_state_params.append(dict(pi0=pi0,
-                                              Ps=Ps,
-                                              log_likes=log_likes))
+            if isinstance(self.transitions, trans.TrialLockedTransitions):
+                discrete_state_params.append(
+                    self._trial_locked_discrete_state_params(pi0, Ps, log_likes, tag))
+            else:
+                discrete_state_params.append(dict(pi0=pi0,
+                                                  Ps=Ps,
+                                                  log_likes=log_likes))
 
         # Update the variational parameters
         variational_posterior.discrete_state_params = discrete_state_params
+
+    def _trial_locked_discrete_state_params(self, pi0, Ps, log_likes, tag):
+        """
+        Compute the exact discrete posterior for a trial-locked SLDS.
+
+        The time-bin representation uses identity transitions within trials,
+        but running forward-backward through long identity-transition stretches
+        can underflow in probability space. This aggregates each trial's
+        log-likelihood, runs the same HMM on the trial chain, and expands the
+        posterior expectations back to time bins.
+        """
+        T, K = log_likes.shape
+        trial_lengths = trial_lengths_from_tag(tag, T, require=True).astype(int)
+        num_trials = len(trial_lengths)
+        stops = np.cumsum(trial_lengths)
+        starts = np.concatenate(([0], stops[:-1])).astype(int)
+
+        trial_log_likes = np.zeros((num_trials, K))
+        for n, (start, stop) in enumerate(zip(starts, stops)):
+            trial_log_likes[n] = np.sum(log_likes[start:stop], axis=0)
+
+        if num_trials == 1:
+            log_posterior = np.log(pi0) + trial_log_likes[0]
+            normalizer = logsumexp(log_posterior)
+            E_trials = np.exp(log_posterior - normalizer)[None, :]
+            E_trial_joints = np.zeros((0, K, K))
+        else:
+            boundary_idxs = stops[:-1].astype(int) - 1
+            E_trials, E_trial_joints, normalizer = \
+                hmm_expected_states(pi0, Ps[boundary_idxs], trial_log_likes)
+
+        Ez = np.zeros((T, K))
+        Ezzp1 = np.zeros((max(T - 1, 0), K, K))
+        for n, (start, stop) in enumerate(zip(starts, stops)):
+            Ez[start:stop] = E_trials[n]
+            if stop - start > 1:
+                Ezzp1[start:stop - 1] = np.diag(E_trials[n])
+            if n < num_trials - 1:
+                Ezzp1[stop - 1] = E_trial_joints[n]
+
+        return dict(pi0=pi0,
+                    Ps=Ps,
+                    log_likes=log_likes,
+                    expectations=(Ez, Ezzp1, normalizer))
 
     # Compute the expected log joint
     def _laplace_neg_expected_log_joint(self,
@@ -648,6 +697,7 @@ class SLDS(object):
         )
         exact_m_step_dynamics = [
            obs.AutoRegressiveObservations,
+           obs.TrialResetAutoRegressiveObservations,
            obs.AutoRegressiveObservationsNoInput,
            obs.AutoRegressiveDiagonalNoiseObservations,
         ]

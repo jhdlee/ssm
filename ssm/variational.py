@@ -294,9 +294,12 @@ class SLDSStructuredMeanFieldVariationalPosterior(VariationalPosterior):
                 assert key in prms
         self._discrete_state_params = value
 
-        # Rerun the HMM smoother with the updated parameters
+        # Rerun the HMM smoother with the updated parameters. Some models,
+        # such as trial-locked SLDS variants, compute an equivalent posterior
+        # on a coarser chain and pass the expanded expectations directly.
         self._discrete_expectations = \
-            [hmm_expected_states(prms["pi0"], prms["Ps"], prms["log_likes"])
+            [prms["expectations"] if "expectations" in prms
+             else hmm_expected_states(prms["pi0"], prms["Ps"], prms["log_likes"])
              for prms in self._discrete_state_params]
 
     @property

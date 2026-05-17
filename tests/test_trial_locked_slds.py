@@ -81,6 +81,52 @@ def test_trial_locked_forward_backward_keeps_states_constant_within_trials():
         start = stop
 
 
+def test_trial_locked_slds_discrete_update_uses_trial_chain():
+    N, K, D = 5, 3, 2
+    trial_lengths = np.array([4, 3])
+    T = int(np.sum(trial_lengths))
+    tag = {"trial_lengths": trial_lengths}
+    model = ssm.SLDS(
+        N,
+        K,
+        D,
+        transitions="trial_locked",
+        dynamics="trial_gaussian",
+        emissions="gaussian",
+        single_subspace=False,
+    )
+
+    pi0 = np.array([0.2, 0.3, 0.5])
+    Ps = model.transitions.transition_matrices(
+        np.zeros((T, D)), np.zeros((T, 0)), np.ones((T, D), dtype=bool), tag)
+    log_likes = -1000.0 * np.ones((T, K))
+    log_likes[0, 0] = 0.0
+    log_likes[1, 1] = 0.0
+    log_likes[2, 2] = 0.0
+    log_likes[3, 0] = 0.0
+    log_likes[4:, 1] = 0.0
+
+    prms = model._trial_locked_discrete_state_params(pi0, Ps, log_likes, tag)
+    Ez, Ezzp1, normalizer = prms["expectations"]
+    assert np.isfinite(normalizer)
+    assert np.all(np.isfinite(Ez))
+    assert np.all(np.isfinite(Ezzp1))
+
+    trial_log_likes = np.array([
+        np.sum(log_likes[:4], axis=0),
+        np.sum(log_likes[4:], axis=0),
+    ])
+    E_trials, E_trial_joints, manual_normalizer = \
+        hmm_expected_states(pi0, Ps[[3]], trial_log_likes)
+
+    assert np.allclose(normalizer, manual_normalizer)
+    assert np.allclose(Ez[:4], E_trials[0])
+    assert np.allclose(Ez[4:], E_trials[1])
+    assert np.allclose(Ezzp1[:3], np.diag(E_trials[0]))
+    assert np.allclose(Ezzp1[3], E_trial_joints[0])
+    assert np.allclose(Ezzp1[4:], np.diag(E_trials[1]))
+
+
 def test_trial_reset_dynamics_likelihood_matches_manual_trial_sum():
     K, D = 2, 2
     trial_lengths = np.array([2, 3])
